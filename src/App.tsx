@@ -80,18 +80,34 @@ function App() {
   const playerRef = useRef<YTPlayer | null>(null);
   const playerHostRef = useRef<HTMLDivElement>(null);
   const [activeStation, setActiveStation] = useState(() => localStorage.getItem('focus-station') || stations[0].id);
-  const [volume, setVolume] = useState(() => Number(localStorage.getItem('focus-volume') || 72));
+  const [volume, setVolume] = useState(() => Number(localStorage.getItem(`volume-${localStorage.getItem('focus-station') || stations[0].id}`) || 72));
   const [isMuted, setIsMuted] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playerReady, setPlayerReady] = useState(false);
-  const [mode, setMode] = useState<'focus' | 'break'>('focus');
+  const [mode, setMode] = useState<'focus' | 'break'>(() => (localStorage.getItem('focus-mode') as 'focus' | 'break') || 'focus');
   const [focusLength, setFocusLength] = useState(() => Number(localStorage.getItem('focus-length') || 25));
-  const [secondsLeft, setSecondsLeft] = useState(() => Number(localStorage.getItem('focus-seconds') || 25 * 60));
-  const [timerRunning, setTimerRunning] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState(() => {
+    const saved = localStorage.getItem('focus-seconds');
+    if (saved && !isNaN(Number(saved))) return Number(saved);
+    return 25 * 60;
+  });
+  const [timerRunning, setTimerRunning] = useState(() => localStorage.getItem('timer-running') === 'true');
   const [showSettings, setShowSettings] = useState(false);
-  const [notice, setNotice] = useState('');
+  const [notice, setNotice] = useState<{ message: string; type: 'info' | 'success' | 'warning' } | null>(null);
+  const [noticeTimeout, setNoticeTimeout] = useState<NodeJS.Timeout | null>(null);
+  const [sessionsCompleted, setSessionsCompleted] = useState(() => 
+    Number(localStorage.getItem('focus-sessions') || 0)
+  );
+  const [isLoadingStation, setIsLoadingStation] = useState(false);
 
   const selectedStation = stations.find((station) => station.id === activeStation) || stations[0];
+
+  const showNotice = (message: string, type: 'info' | 'success' | 'warning' = 'info') => {
+    if (noticeTimeout) clearTimeout(noticeTimeout);
+    setNotice({ message, type });
+    const timeout = setTimeout(() => setNotice(null), 4000);
+    setNoticeTimeout(timeout);
+  };
 
   const loadPlayer = useCallback(() => {
     if (!window.YT || !playerHostRef.current || playerRef.current) return;
@@ -102,6 +118,7 @@ function App() {
         onReady: () => {
           playerRef.current?.setVolume(volume);
           setPlayerReady(true);
+          showNotice('🎵 Player is ready!', 'success');
         },
         onStateChange: (event) => {
           if (window.YT && event.data === window.YT.PlayerState.PLAYING) setIsPlaying(true);
@@ -128,52 +145,143 @@ function App() {
 
   useEffect(() => {
     localStorage.setItem('focus-station', activeStation);
-    if (playerReady) playerRef.current?.loadVideoById(activeStation);
+    if (playerReady && playerRef.current) {
+      setIsLoadingStation(true);
+      playerRef.current.loadVideoById(activeStation);
+      setTimeout(() => setIsLoadingStation(false), 800);
+    }
   }, [activeStation, playerReady]);
 
   useEffect(() => {
-    localStorage.setItem('focus-volume', volume.toString());
+    const savedVolume = localStorage.getItem(`volume-${activeStation}`);
+    if (savedVolume) {
+      const vol = Number(savedVolume);
+      setVolume(vol);
+      playerRef.current?.setVolume(vol);
+    }
+  }, [activeStation]);
+
+  useEffect(() => {
+    localStorage.setItem(`volume-${activeStation}`, volume.toString());
     playerRef.current?.setVolume(volume);
-  }, [volume]);
+  }, [volume, activeStation]);
 
   useEffect(() => {
     localStorage.setItem('focus-length', focusLength.toString());
   }, [focusLength]);
 
   useEffect(() => {
+    localStorage.setItem('focus-mode', mode);
+    localStorage.setItem('timer-running', timerRunning.toString());
+  }, [mode, timerRunning]);
+
+  useEffect(() => {
+    localStorage.setItem('focus-sessions', sessionsCompleted.toString());
+  }, [sessionsCompleted]);
+
+  // Timer logic
+  useEffect(() => {
     if (!timerRunning) return;
+    
     const timer = window.setInterval(() => {
       setSecondsLeft((current) => {
         if (current <= 1) {
           setTimerRunning(false);
-          setMode((currentMode) => {
-            const nextMode = currentMode === 'focus' ? 'break' : 'focus';
-            if (nextMode === 'break') playerRef.current?.pauseVideo();
-            return nextMode;
-          });
-          setNotice(mode === 'focus' ? 'Focus session complete. Time for a little reset.' : 'Break is over. Ready when you are.');
-          return mode === 'focus' ? 5 * 60 : focusLength * 60;
+          
+          if (mode === 'focus') {
+            // Focus session completed
+            setMode('break');
+            setSecondsLeft(5 * 60);
+            showNotice('🎯 Focus complete! Take a 5-minute break.', 'success');
+            playerRef.current?.pauseVideo();
+            setSessionsCompleted(prev => prev + 1);
+          } else {
+            // Break session completed
+            setMode('focus');
+            setSecondsLeft(focusLength * 60);
+            showNotice('⏰ Break over! Ready to focus again?', 'warning');
+          }
+          
+          localStorage.removeItem('focus-seconds');
+          return 0;
         }
+        
         const next = current - 1;
         localStorage.setItem('focus-seconds', next.toString());
         return next;
       });
     }, 1000);
+    
     return () => window.clearInterval(timer);
   }, [timerRunning, mode, focusLength]);
 
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handleKeyPress = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+      
+      switch(e.code) {
+        case 'Space':
+          e.preventDefault();
+          togglePlayback();
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          skipStation(1);
+          break;
+        case 'ArrowLeft':
+          e.preventDefault();
+          skipStation(-1);
+          break;
+        case 'KeyT':
+          e.preventDefault();
+          setTimerRunning(prev => !prev);
+          break;
+        case 'KeyR':
+          e.preventDefault();
+          resetTimer();
+          break;
+        case 'KeyM':
+          e.preventDefault();
+          toggleMute();
+          break;
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyPress);
+    return () => window.removeEventListener('keydown', handleKeyPress);
+  }, []);
+
   const togglePlayback = () => {
     if (!playerReady) {
-      setNotice('Connecting to YouTube…');
+      showNotice('⏳ Connecting to YouTube…', 'info');
       return;
     }
-    if (isPlaying) playerRef.current?.pauseVideo();
-    else playerRef.current?.playVideo();
+    if (isPlaying) {
+      playerRef.current?.pauseVideo();
+    } else {
+      playerRef.current?.playVideo();
+    }
   };
 
   const selectStation = (station: Station) => {
+    if (isLoadingStation) return;
+    setIsLoadingStation(true);
     setActiveStation(station.id);
-    setNotice(`${station.name} is ready to play.`);
+    showNotice(`🎵 Loading ${station.name}...`, 'info');
+    setTimeout(() => {
+      setIsLoadingStation(false);
+      showNotice(`${station.name} is ready.`, 'success');
+    }, 800);
+  };
+
+  const toggleMute = () => {
+    setIsMuted(!isMuted);
+    if (!isMuted) {
+      playerRef.current?.mute();
+    } else {
+      playerRef.current?.unMute();
+    }
   };
 
   const changeMode = (nextMode: 'focus' | 'break') => {
@@ -186,6 +294,7 @@ function App() {
     setTimerRunning(false);
     setSecondsLeft(mode === 'focus' ? focusLength * 60 : 5 * 60);
     localStorage.removeItem('focus-seconds');
+    showNotice('⏱️ Timer reset', 'info');
   };
 
   const skipStation = (direction: number) => {
@@ -193,6 +302,9 @@ function App() {
     const next = stations[(index + direction + stations.length) % stations.length];
     selectStation(next);
   };
+
+  const totalSeconds = mode === 'focus' ? focusLength * 60 : 5 * 60;
+  const progress = 1 - (secondsLeft / totalSeconds);
 
   return (
     <div className="app-shell">
@@ -215,29 +327,229 @@ function App() {
       </aside>
 
       <main className="main-content">
-        <header className="topbar"><div className="breadcrumbs"><span>Wednesday, August 31</span><span className="crumb-separator">/</span><strong>Good afternoon, Alex</strong></div><div className="top-actions"><button className="icon-button" aria-label="Notifications"><Bell size={18} /></button><div className="status-pill"><span className="status-dot" />Your space is quiet</div></div></header>
+        <header className="topbar">
+          <div className="breadcrumbs"><span>Wednesday, August 31</span><span className="crumb-separator">/</span><strong>Good afternoon, Alex</strong></div>
+          <div className="top-actions">
+            <button className="icon-button" aria-label="Notifications"><Bell size={18} /></button>
+            <button className={`icon-button ${timerRunning ? 'active' : ''}`} onClick={() => setTimerRunning(!timerRunning)} aria-label="Toggle timer">
+              <Moon size={18} />
+            </button>
+            <div className="status-pill"><span className="status-dot" />{timerRunning ? 'Focusing' : 'Paused'}</div>
+          </div>
+        </header>
 
         <div className="content-wrap">
-          <section className="welcome-row"><div><p className="eyebrow">FOCUS ROOM <span>•</span> SESSION 01</p><h1>Make room for <em>good work.</em></h1><p className="subheading">A softer place to think, create, and get things done.</p></div><button className="date-picker"><span className="calendar-icon">31</span><span>Today</span><ChevronDown size={15} /></button></section>
+          <section className="welcome-row"><div><p className="eyebrow">FOCUS ROOM <span>•</span> SESSION {sessionsCompleted + 1}</p><h1>Make room for <em>good work.</em></h1><p className="subheading">A softer place to think, create, and get things done.</p></div><button className="date-picker"><span className="calendar-icon">31</span><span>Today</span><ChevronDown size={15} /></button></section>
 
           <section className="workspace-grid">
             <div className="player-card card-surface">
-              <div className="ambient-art" style={{ '--station-color': selectedStation.color } as React.CSSProperties}><div className="ambient-glow" /><div className="ambient-grid" /><div className="ambient-orb orb-one" /><div className="ambient-orb orb-two" /><div className="player-embed" ref={playerHostRef} /></div>
-              <div className="player-info"><div><div className="playing-label"><span className={`sound-wave ${isPlaying ? 'playing' : ''}`}><i /><i /><i /><i /></span>{isPlaying ? 'NOW PLAYING' : 'READY WHEN YOU ARE'}</div><h2>{selectedStation.name}</h2><p>{selectedStation.description}</p></div><div className="player-actions"><button className="round-control" onClick={() => skipStation(-1)} aria-label="Previous station"><SkipBack size={17} /></button><button className="play-button" onClick={togglePlayback} aria-label={isPlaying ? 'Pause' : 'Play'}>{isPlaying ? <Pause size={22} fill="currentColor" /> : <Play size={22} fill="currentColor" />}</button><button className="round-control" onClick={() => skipStation(1)} aria-label="Next station"><SkipForward size={17} /></button></div></div>
+              <div className="ambient-art" style={{ '--station-color': selectedStation.color } as React.CSSProperties}>
+                <div className="ambient-glow" />
+                <div className="ambient-grid" />
+                <div className="ambient-orb orb-one" />
+                <div className="ambient-orb orb-two" />
+                <div className="player-embed" ref={playerHostRef} />
+              </div>
+              <div className="player-info">
+                <div>
+                  <div className="playing-label">
+                    <span className={`sound-wave ${isPlaying ? 'playing' : ''}`}>
+                      <i /><i /><i /><i />
+                    </span>
+                    {isPlaying ? 'NOW PLAYING' : isLoadingStation ? 'LOADING...' : 'READY WHEN YOU ARE'}
+                  </div>
+                  <h2>{selectedStation.name}</h2>
+                  <p>{selectedStation.description}</p>
+                </div>
+                <div className="player-actions">
+                  <button className="round-control" onClick={() => skipStation(-1)} aria-label="Previous station"><SkipBack size={17} /></button>
+                  <button 
+                    className="play-button" 
+                    onClick={togglePlayback} 
+                    disabled={isLoadingStation}
+                    aria-label={isLoadingStation ? 'Loading...' : isPlaying ? 'Pause' : 'Play'}
+                  >
+                    {isLoadingStation ? (
+                      <span className="loading-spinner" style={{ fontSize: '16px' }}>⟳</span>
+                    ) : isPlaying ? (
+                      <Pause size={22} fill="currentColor" />
+                    ) : (
+                      <Play size={22} fill="currentColor" />
+                    )}
+                  </button>
+                  <button className="round-control" onClick={() => skipStation(1)} aria-label="Next station"><SkipForward size={17} /></button>
+                </div>
+              </div>
               <div className="player-progress"><span>Live radio</span><div className="progress-track"><div className={`progress-fill ${isPlaying ? 'moving' : ''}`} /></div><span>{selectedStation.duration}</span></div>
-              <div className="volume-row"><button className="volume-icon" onClick={() => { setIsMuted(!isMuted); if (!isMuted) playerRef.current?.mute(); else playerRef.current?.unMute(); }} aria-label={isMuted ? 'Unmute' : 'Mute'}>{isMuted ? <VolumeX size={17} /> : <Volume2 size={17} />}</button><input type="range" min="0" max="100" value={isMuted ? 0 : volume} onChange={(event) => { setIsMuted(false); setVolume(Number(event.target.value)); }} aria-label="Volume" /><span>{isMuted ? 0 : volume}%</span></div>
+              <div className="volume-row">
+                <button className="volume-icon" onClick={toggleMute} aria-label={isMuted ? 'Unmute' : 'Mute'}>
+                  {isMuted ? <VolumeX size={17} /> : <Volume2 size={17} />}
+                </button>
+                <input 
+                  type="range" 
+                  min="0" 
+                  max="100" 
+                  value={isMuted ? 0 : volume} 
+                  onChange={(event) => { 
+                    setIsMuted(false); 
+                    setVolume(Number(event.target.value)); 
+                  }} 
+                  aria-label="Volume" 
+                />
+                <span>{isMuted ? 0 : volume}%</span>
+              </div>
             </div>
 
-            <div className="timer-card card-surface"><div className="card-heading"><div><p className="eyebrow">YOUR TIMER</p><h2>Stay in the flow</h2></div><button className="icon-button subtle" onClick={resetTimer} aria-label="Reset timer"><RotateCcw size={17} /></button></div><div className="mode-switch"><button className={mode === 'focus' ? 'active' : ''} onClick={() => changeMode('focus')}>Focus</button><button className={mode === 'break' ? 'active' : ''} onClick={() => changeMode('break')}>Break</button></div><div className="timer-display"><div className={`timer-ring ${timerRunning ? 'timer-active' : ''}`}><div><span>{formatTime(secondsLeft)}</span><small>{timerRunning ? 'in session' : 'paused'}</small></div></div></div><div className="timer-controls"><button className="timer-main-button" onClick={() => setTimerRunning(!timerRunning)}>{timerRunning ? <><Pause size={16} fill="currentColor" />Pause timer</> : <><Play size={16} fill="currentColor" />Start timer</>}</button><button className="timer-reset" onClick={resetTimer}><TimerReset size={16} /></button></div><div className="timer-note"><span className="tiny-sparkle"><Sparkles size={13} /></span><span>{mode === 'focus' ? 'A clear mind does its best work.' : 'Step away. Let your mind wander.'}</span></div></div>
+            <div className="timer-card card-surface">
+              <div className="card-heading">
+                <div><p className="eyebrow">YOUR TIMER</p><h2>Stay in the flow</h2></div>
+                <button className="icon-button subtle" onClick={resetTimer} aria-label="Reset timer"><RotateCcw size={17} /></button>
+              </div>
+              <div className="mode-switch">
+                <button className={mode === 'focus' ? 'active' : ''} onClick={() => changeMode('focus')}>Focus</button>
+                <button className={mode === 'break' ? 'active' : ''} onClick={() => changeMode('break')}>Break</button>
+              </div>
+              <div className="timer-display">
+                <div className="timer-ring" style={{
+                  background: `radial-gradient(circle, #131316 57%, transparent 58%), conic-gradient(#e7e7ea ${progress * 100}%, #27272a ${progress * 100}%)`,
+                }}>
+                  <div>
+                    <span>{formatTime(secondsLeft)}</span>
+                    <small>{timerRunning ? 'in session' : 'paused'}</small>
+                    <small style={{ marginTop: '4px', fontSize: '7px', color: '#52525b' }}>
+                      {Math.round(progress * 100)}%
+                    </small>
+                  </div>
+                </div>
+              </div>
+              <div className="timer-controls">
+                <button className="timer-main-button" onClick={() => setTimerRunning(!timerRunning)}>
+                  {timerRunning ? <><Pause size={16} fill="currentColor" />Pause timer</> : <><Play size={16} fill="currentColor" />Start timer</>}
+                </button>
+                <button className="timer-reset" onClick={resetTimer}><TimerReset size={16} /></button>
+              </div>
+              
+              {/* Study Statistics */}
+              <div className="timer-stats">
+                <div className="stat-item">
+                  <div className="stat-label">Today's Sessions</div>
+                  <div className="stat-value">{sessionsCompleted}</div>
+                </div>
+                <div className="stat-item">
+                  <div className="stat-label">Total Focus Time</div>
+                  <div className="stat-value">{Math.floor(sessionsCompleted * focusLength / 60)}h</div>
+                </div>
+              </div>
+
+              {/* Keyboard Shortcuts */}
+              <div className="shortcuts-bar">
+                <span><kbd>Space</kbd> Play/Pause</span>
+                <span><kbd>← →</kbd> Stations</span>
+                <span><kbd>T</kbd> Timer</span>
+                <span><kbd>R</kbd> Reset</span>
+                <span><kbd>M</kbd> Mute</span>
+              </div>
+
+              <div className="timer-note">
+                <span className="tiny-sparkle"><Sparkles size={13} /></span>
+                <span>{mode === 'focus' ? 'A clear mind does its best work.' : 'Step away. Let your mind wander.'}</span>
+              </div>
+            </div>
           </section>
 
-          <section className="stations-section"><div className="section-heading"><div><p className="eyebrow">EXPLORE SOUNDS</p><h2>Find your atmosphere</h2></div><button className="text-button">View all <ChevronRight size={15} /></button></div><div className="station-grid">{stations.map((station) => { const Icon = station.icon; return <button key={station.id} className={`station-card ${station.id === activeStation ? 'active' : ''}`} onClick={() => selectStation(station)}><div className="station-art" style={{ '--station-color': station.color } as React.CSSProperties}><Icon size={26} strokeWidth={1.5} /><span className="station-duration">{station.duration}</span>{station.id === activeStation && <span className="active-badge"><span className="mini-bars"><i /><i /><i /></span>Active</span>}</div><div className="station-copy"><strong>{station.name}</strong><span>{station.description}</span></div><span className="station-arrow"><ChevronRight size={15} /></span></button>; })}<button className="add-station"><span><Plus size={21} /></span><strong>Add a station</strong><small>Make it yours</small></button></div></section>
+          <section className="stations-section">
+            <div className="section-heading">
+              <div><p className="eyebrow">EXPLORE SOUNDS</p><h2>Find your atmosphere</h2></div>
+              <button className="text-button">View all <ChevronRight size={15} /></button>
+            </div>
+            <div className="station-grid">
+              {stations.map((station) => { 
+                const Icon = station.icon; 
+                return <button key={station.id} className={`station-card ${station.id === activeStation ? 'active' : ''}`} onClick={() => selectStation(station)}>
+                  <div className="station-art" style={{ '--station-color': station.color } as React.CSSProperties}>
+                    <Icon size={26} strokeWidth={1.5} />
+                    <span className="station-duration">{station.duration}</span>
+                    {station.id === activeStation && <span className="active-badge"><span className="mini-bars"><i /><i /><i /></span>Active</span>}
+                  </div>
+                  <div className="station-copy">
+                    <strong>{station.name}</strong>
+                    <span>{station.description}</span>
+                  </div>
+                  <span className="station-arrow"><ChevronRight size={15} /></span>
+                </button>; 
+              })}
+              <button className="add-station"><span><Plus size={21} /></span><strong>Add a station</strong><small>Make it yours</small></button>
+            </div>
+          </section>
           <section className="footer-note"><Moon size={15} /><span>Dark mode is on</span><span className="footer-separator">•</span><span>Your preferences are saved on this device</span></section>
         </div>
       </main>
 
-      {notice && <button className="notice" onClick={() => setNotice('')}>{notice}<X size={14} /></button>}
-      {showSettings && <div className="modal-backdrop" onClick={() => setShowSettings(false)}><div className="settings-modal" onClick={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="eyebrow">PERSONALIZE</p><h2>Room settings</h2></div><button className="icon-button" onClick={() => setShowSettings(false)}><X size={18} /></button></div><label>Focus session length<select value={focusLength} onChange={(event) => { const next = Number(event.target.value); setFocusLength(next); if (mode === 'focus') setSecondsLeft(next * 60); }}><option value={25}>25 minutes</option><option value={50}>50 minutes</option><option value={90}>90 minutes</option></select></label><div className="setting-row"><div><strong>Auto-pause on break</strong><small>Pause the station when focus ends</small></div><span className="toggle on"><span /></span></div><div className="setting-row"><div><strong>Ambient visuals</strong><small>Keep the room animation moving</small></div><span className="toggle on"><span /></span></div></div></div>}
+      {notice && (
+        <div className={`notice notice-${notice.type}`} onClick={() => setNotice(null)}>
+          <span>{notice.message}</span>
+          <X size={14} style={{ opacity: 0.5, flexShrink: 0 }} />
+        </div>
+      )}
+      
+      {showSettings && (
+        <div className="modal-backdrop" onClick={() => setShowSettings(false)}>
+          <div className="settings-modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div><p className="eyebrow">PERSONALIZE</p><h2>Room settings</h2></div>
+              <button className="icon-button" onClick={() => setShowSettings(false)}><X size={18} /></button>
+            </div>
+            <label>
+              Focus session length
+              <select 
+                value={focusLength} 
+                onChange={(event) => { 
+                  const next = Number(event.target.value); 
+                  setFocusLength(next); 
+                  if (mode === 'focus') {
+                    setSecondsLeft(next * 60);
+                    localStorage.setItem('focus-seconds', (next * 60).toString());
+                  }
+                }}
+              >
+                <option value={25}>25 minutes</option>
+                <option value={50}>50 minutes</option>
+                <option value={90}>90 minutes</option>
+              </select>
+            </label>
+            <div className="setting-row">
+              <div><strong>Auto-pause on break</strong><small>Pause the station when focus ends</small></div>
+              <span className="toggle on"><span /></span>
+            </div>
+            <div className="setting-row">
+              <div><strong>Ambient visuals</strong><small>Keep the room animation moving</small></div>
+              <span className="toggle on"><span /></span>
+            </div>
+            <div className="setting-row" style={{ borderTop: 'none', marginTop: '12px', paddingTop: '0' }}>
+              <div><strong>Total focus sessions</strong><small>{sessionsCompleted} completed</small></div>
+              <button 
+                onClick={() => {
+                  if (confirm('Reset all session data?')) {
+                    setSessionsCompleted(0);
+                    localStorage.removeItem('focus-sessions');
+                    showNotice('Sessions reset', 'info');
+                  }
+                }}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: '9px',
+                  color: '#ef4444',
+                  background: 'transparent',
+                  border: '1px solid #27272a',
+                  borderRadius: '4px'
+                }}
+              >
+                Reset stats
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
